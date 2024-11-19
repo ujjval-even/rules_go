@@ -156,6 +156,13 @@ go_repository(
 )
 
 go_repository(
+    name = "protoc_go_inject_tag",
+    commit = "0a17badb4eb218eeb53ca216cedd17d873695f64",
+    importpath = "github.com/favadi/protoc-go-inject-tag",
+    version = "v1.4.0",
+)
+
+go_repository(
     name = "com_github_google_go_querystring",
     importpath = "github.com/google/go-querystring",
     sum = "h1:AnCroh3fv4ZBgVIf1Iwtovgjaw/GiKJo8M8yD/fhyJ8=",

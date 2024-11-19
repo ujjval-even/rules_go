@@ -135,13 +135,16 @@ def _go_proto_library_impl(ctx):
         compiler = c[GoProtoCompiler]
         if compiler.valid_archive:
             valid_archive = True
-        go_srcs.extend(compiler.compile(
+        generated_files = compiler.compile(
             go,
             compiler = compiler,
             protos = [d[ProtoInfo] for d in proto_deps],
             imports = get_imports(ctx.attr, go.importpath),
             importpath = go.importpath,
-        ))
+        )
+        go_srcs.extend(generated_files)
+        for src in generated_files:
+            print(src)
 
     go_info = new_go_info(
         go,
@@ -156,11 +159,16 @@ def _go_proto_library_impl(ctx):
     }
     if valid_archive:
         archive = go.archive(go, go_info)
-        output_groups["compilation_outputs"] = [archive.data.file]
+        files = [archive.data.file]
+        if len(go_srcs) > 0:
+            f = ctx.actions.declare_file("go.mod", sibling = go_srcs[0])
+            ctx.actions.write(output = f, content = "go 1.18", is_executable = True)
+            files.append(f)
+        output_groups["compilation_outputs"] = files
         providers.extend([
             archive,
             DefaultInfo(
-                files = depset([archive.data.file]),
+                files = depset(files),
                 runfiles = archive.runfiles,
             ),
         ])
