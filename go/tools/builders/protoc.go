@@ -20,11 +20,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 )
@@ -139,6 +143,7 @@ func run(args []string) error {
 		if relPath == "." {
 			return nil
 		}
+		fmt.Println(path, "<--")
 
 		if f.IsDir() {
 			if err := os.Mkdir(filepath.Join(absOutPath, relPath), f.Mode()); !os.IsExist(err) {
@@ -193,15 +198,18 @@ func run(args []string) error {
 		case f.expected && f.ambiguious:
 			fmt.Fprintf(buf, "Ambiguious output %v.\n", f.path)
 		case f.from != nil:
-			data, err := ioutil.ReadFile(f.from.path)
+			fmt.Printf("Generated output %v.\n", f.from.path)
+			areas, err := parseFile(f.from.path, nil, []string{})
 			if err != nil {
 				return err
 			}
+			data, err := getUpdatedFileContent(
+				f.from.path, areas, false /*removeTagComment*/)
 			if err := ioutil.WriteFile(abs(f.path), data, 0644); err != nil {
 				return err
 			}
 		case !f.expected:
-			//fmt.Fprintf(buf, "Unexpected output %v.\n", f.path)
+			// fmt.Fprintf(buf, "Unexpected output %v.\n", f.path)
 		}
 		if buf.Len() > 0 {
 			fmt.Fprintf(buf, "Check that the go_package option is %q.", *importpath)
@@ -216,4 +224,243 @@ func main() {
 	if err := run(os.Args[1:]); err != nil {
 		log.Fatal(err)
 	}
+}
+
+var (
+	rComment = regexp.MustCompile(`^//.*?@(?i:gotags?|inject_tags?):\s*(.*)$`)
+	rInject  = regexp.MustCompile("`.+`$")
+	rTags    = regexp.MustCompile(`[\w_]+:"[^"]+"`)
+	rAll     = regexp.MustCompile(".*")
+)
+
+type textArea struct {
+	Start        int
+	End          int
+	CurrentTag   string
+	InjectTag    string
+	CommentStart int
+	CommentEnd   int
+}
+
+func tagFromComment(comment string) (tag string) {
+	match := rComment.FindStringSubmatch(comment)
+	if len(match) == 2 {
+		tag = match[1]
+	}
+	return
+}
+
+type tagItem struct {
+	key   string
+	value string
+}
+
+type tagItems []tagItem
+
+func (ti tagItems) format() string {
+	tags := []string{}
+	for _, item := range ti {
+		tags = append(tags, fmt.Sprintf(`%s:%s`, item.key, item.value))
+	}
+	return strings.Join(tags, " ")
+}
+
+func newTagItems(tag string) tagItems {
+	items := []tagItem{}
+	splitted := rTags.FindAllString(tag, -1)
+
+	for _, t := range splitted {
+		sepPos := strings.Index(t, ":")
+		items = append(items, tagItem{
+			key:   t[:sepPos],
+			value: t[sepPos+1:],
+		})
+	}
+	return items
+}
+
+func (ti tagItems) override(nti tagItems) tagItems {
+	overrided := []tagItem{}
+	for i := range ti {
+		dup := -1
+		for j := range nti {
+			if ti[i].key == nti[j].key {
+				dup = j
+				break
+			}
+		}
+		if dup == -1 {
+			overrided = append(overrided, ti[i])
+		} else {
+			overrided = append(overrided, nti[dup])
+			nti = append(nti[:dup], nti[dup+1:]...)
+		}
+	}
+	return append(overrided, nti...)
+}
+
+func injectTag(contents []byte, area textArea, removeTagComment bool) (injected []byte) {
+	expr := make([]byte, area.End-area.Start)
+	copy(expr, contents[area.Start-1:area.End-1])
+	cti := newTagItems(area.CurrentTag)
+	iti := newTagItems(area.InjectTag)
+	ti := cti.override(iti)
+	expr = rInject.ReplaceAll(expr, []byte(fmt.Sprintf("`%s`", ti.format())))
+
+	if removeTagComment {
+		strippedComment := make([]byte, area.CommentEnd-area.CommentStart)
+		copy(strippedComment, contents[area.CommentStart-1:area.CommentEnd-1])
+		strippedComment = rAll.ReplaceAll(expr, []byte(" "))
+		if area.CommentStart < area.Start {
+			injected = append(injected, contents[:area.CommentStart-1]...)
+			injected = append(injected, strippedComment...)
+			injected = append(injected, contents[area.CommentEnd-1:area.Start-1]...)
+			injected = append(injected, expr...)
+			injected = append(injected, contents[area.End-1:]...)
+		} else {
+			injected = append(injected, contents[:area.Start-1]...)
+			injected = append(injected, expr...)
+			injected = append(injected, contents[area.End-1:area.CommentStart-1]...)
+			injected = append(injected, strippedComment...)
+			injected = append(injected, contents[area.CommentEnd-1:]...)
+		}
+	} else {
+		injected = append(injected, contents[:area.Start-1]...)
+		injected = append(injected, expr...)
+		injected = append(injected, contents[area.End-1:]...)
+	}
+
+	return
+}
+
+func getUpdatedFileContent(
+	inputPath string, areas []textArea, removeTagComment bool) (
+	contents []byte, err error) {
+	f, err := os.Open(inputPath)
+	if err != nil {
+		return
+	}
+
+	contents, err = ioutil.ReadAll(f)
+	if err != nil {
+		return
+	}
+
+	if err = f.Close(); err != nil {
+		return
+	}
+
+	// inject custom tags from tail of file first to preserve order
+	for i := range areas {
+		area := areas[len(areas)-i-1]
+		contents = injectTag(contents, area, removeTagComment)
+	}
+	if len(areas) > 0 {
+		log.Printf("file %q is injected with custom tags", inputPath)
+	} else {
+		log.Printf("file %q is not injected with custom tags", inputPath)
+	}
+	return
+}
+
+func parseFile(inputPath string, src interface{}, xxxSkip []string) (areas []textArea, err error) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, inputPath, src, parser.ParseComments)
+	if err != nil {
+		return
+	}
+
+	for _, decl := range f.Decls {
+		// check if is generic declaration
+		genDecl, ok := decl.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+
+		var typeSpec *ast.TypeSpec
+		for _, spec := range genDecl.Specs {
+			if ts, tsOK := spec.(*ast.TypeSpec); tsOK {
+				typeSpec = ts
+				break
+			}
+		}
+
+		// skip if can't get type spec
+		if typeSpec == nil {
+			continue
+		}
+
+		// not a struct, skip
+		structDecl, ok := typeSpec.Type.(*ast.StructType)
+		if !ok {
+			continue
+		}
+
+		builder := strings.Builder{}
+		if len(xxxSkip) > 0 {
+			for i, skip := range xxxSkip {
+				builder.WriteString(fmt.Sprintf("%s:\"-\"", skip))
+				if i > 0 {
+					builder.WriteString(",")
+				}
+			}
+		}
+
+		for _, field := range structDecl.Fields.List {
+			// skip if field has no doc
+			if len(field.Names) > 0 {
+				name := field.Names[0].Name
+				if len(xxxSkip) > 0 && strings.HasPrefix(name, "XXX") {
+					currentTag := field.Tag.Value
+					area := textArea{
+						Start:      int(field.Pos()),
+						End:        int(field.End()),
+						CurrentTag: currentTag[1 : len(currentTag)-1],
+						InjectTag:  builder.String(),
+					}
+					areas = append(areas, area)
+				}
+			}
+
+			comments := []*ast.Comment{}
+
+			if field.Doc != nil {
+				comments = append(comments, field.Doc.List...)
+			}
+
+			// The "doc" field (above comment) is more commonly "free-form"
+			// due to the ability to have a much larger comment without it
+			// being unwieldy. As such, the "comment" field (trailing comment),
+			// should take precedence if there happen to be multiple tags
+			// specified, both in the field doc, and the field line. Whichever
+			// comes last, will take precedence.
+			if field.Comment != nil {
+				comments = append(comments, field.Comment.List...)
+			}
+
+			for _, comment := range comments {
+				tag := tagFromComment(comment.Text)
+				if tag == "" {
+					continue
+				}
+
+				if strings.Contains(comment.Text, "inject_tag") {
+					log.Printf("warn: deprecated 'inject_tag' used")
+				}
+
+				currentTag := field.Tag.Value
+				area := textArea{
+					Start:        int(field.Pos()),
+					End:          int(field.End()),
+					CurrentTag:   currentTag[1 : len(currentTag)-1],
+					InjectTag:    tag,
+					CommentStart: int(comment.Pos()),
+					CommentEnd:   int(comment.End()),
+				}
+				areas = append(areas, area)
+			}
+		}
+	}
+	log.Printf("parsed file %q, number of fields to inject custom tags: %d", inputPath, len(areas))
+	return
 }
